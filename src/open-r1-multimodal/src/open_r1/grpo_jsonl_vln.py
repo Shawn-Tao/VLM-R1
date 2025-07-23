@@ -24,7 +24,7 @@ from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
 from math_verify import parse, verify
-from open_r1.trainer import VLMGRPOTrainer, GRPOConfig
+# from open_r1.trainer import VLMGRPOTrainer, GRPOConfig
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 import PIL
 from Levenshtein import ratio
@@ -35,6 +35,10 @@ import math
 from json_repair import repair_json
 
 from open_r1.vlm_modules import *
+
+from open_r1.trainer import GRPOConfig
+from open_r1.trainer.grpo_trainer_vln import VLMGRPOTrainer_VLN
+
 
 from typing import Tuple
 from transformers.utils import logging
@@ -563,6 +567,9 @@ def detection_score(content, sol, iou_threshold=0.5, alpha=0.7, beta=0.0, gamma=
 
     return final_score
 
+
+# 根据生成文本的长度和准确性提供动态奖励;使用余弦函数创建非线性奖励曲线;当长度接近1024时完成一个完整周期;防止模型生成冗长但正确的废话;避免错误答案中产生大量无关内容;
+# 特别适合开放式问答任务--- VLN就不用了
 def cosine_reward(content, tokenizer, acc_reward, **kwargs):
     #https://arxiv.org/abs/2502.03373
     min_len_value_wrong = 0.0
@@ -590,6 +597,7 @@ def cosine_reward(content, tokenizer, acc_reward, **kwargs):
 
     return reward
 
+# 检测并惩罚生成内容中的重复模式； 感觉意义不大呢
 def repetition_reward(content, **kwargs):
     max_penalty = -1.0
 
@@ -705,8 +713,6 @@ def repetition_rewards(completions, solution, **kwargs):
                     f.write(f"problem: {problem}\n")
                     f.write(f"Content: {content}\n")
                     f.write(f"Solution: {sol}\n")     
-
-
 
     return rewards
 
@@ -824,6 +830,7 @@ def default_accuracy_reward(content, sol, **kwargs):
 
     return reward
 
+# 数学准确性奖励，这里我们不是数学问题，用导航指令准确性取代了
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
@@ -898,11 +905,128 @@ def format_reward(completions, **kwargs):
     return [1.0 if match else 0.0 for match in matches]
 
 
+
+def vln_format_reward(completions, **kwargs):
+    """Reward function that checks if the completion has a specific format."""
+    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+    if os.getenv("DEBUG_MODE") == "true":
+        log_path = os.getenv("LOG_PATH")
+        with open(log_path.replace(".txt", "_format.txt"), "a", encoding='utf-8') as f:
+            f.write(f"------------- {current_time} Format reward -------------\n")
+            for content, match in zip(completion_contents, matches):
+                f.write(f"Content: {content}\n")
+                f.write(f"Has format: {bool(match)}\n")
+
+    return [1.0 if match else 0.0 for match in matches]
+
+# 一般而言，completion 代表模型生成的内容，solution 代表正确答案或参考答案。
+def direction_estimate_reward(completions, solution, **kwargs):
+    reward = 0
+    completion_contents = [completion[0]["content"] for completion in completions]
+    for content, sol in zip(completion_contents, solution):
+        # 匹配方向，如果运动方向正确，给1.0，如果运动方向错误，根据错误的情况来分配奖励
+        if re.search(r'move forward', sol):
+            if re.search(r'move forward', content):
+                reward =  1.0
+            else:
+                # 检查转向角度，
+                turn_left_match = re.search(r'turn left|turn right', content)
+                if turn_left_match:
+                    degree_match = re.search(r'degrees', content)
+                    degree_str = content[turn_left_match.end()+1:degree_match.start()-1]
+                    degree = float(degree_str)
+                    if degree == 15:
+                        reward =  0.5
+                    elif degree == 30:
+                        reward =  0.3
+                    else:
+                        reward =  0.0
+        elif re.search(r'turn left', sol):
+            if re.search(r'turn left', content):
+                reward = 1.0
+            elif re.search(r'move forward', content):
+                reward =  0.5
+            elif re.search(r'turn right', content):
+                reward =  0.0
+        elif re.search(r'turn right', sol):
+            if re.search(r'turn right', content):
+                reward =  1.0
+            elif re.search(r'move forward', content):
+                reward= 0.5
+            elif re.search(r'turn left', content):
+                reward= 0.0
+            
+    return reward
+
+# 惩罚原地旋转的行为 --- 加入历史动作之后好像已经解决了一部分
+def rotation_negative_reward(completions, solution, **kwargs):
+    completion_contents = [completion[0]["content"] for completion in completions]
+    reward = 0
+    history_action = []
+    rotate_phinominon = False
+    
+    # 从 completion_contents 中提取历史信息。
+    
+    # 判断是否发生了原地旋转
+    for i in range(len(history_action)-1):
+        if history_action[i] == "turn left" and history_action[i+1] == "turn right":
+            rotate_phinominon = True
+        elif history_action[i] == "turn right" and history_action[i+1] == "turn left":
+            rotate_phinominon = True
+    
+    #! 这里还要确保是小角度连续旋转，大角度转4次可能是掉头。       
+    for i in range(len(history_action)-4):
+        if history_action[i] == "turn left" and history_action[i+1] == "turn left" and history_action[i+2] == "turn left" and history_action[i+3] == "turn left":
+            rotate_phinominon = True
+        elif history_action[i] == "turn right" and history_action[i+1] == "turn right" and history_action[i+2] == "turn right" and history_action[i+3] == "turn right":
+            rotate_phinominon = True
+    # 如果有原地旋转，先左转，后右转，或连续超同一个方向小角度旋转多次，就给负奖励
+    if rotate_phinominon == True:
+        reward = -1
+    
+    
+    return reward
+
+def navigation_format_reward(completions,**kwargs):
+    completion_contents = [completion[0]["content"] for completion in completions]
+    pattern = r'^(?:move forward (?:\.\d+|\d+(?:\.\d*)?) meter|turn left \d+ degrees|turn right \d+ degrees|stop)$'
+    if(re.match(pattern, completion_contents)):
+        return 1.0
+    else:
+        return -1.0
+    
+    
+# !首先根据航向、位置、动作推理下一步是原理目标还是接=近目标，然后来计算reward
+# !要求保存图像和指令之外，还要保存目标位置、航向、当前位置等信息，尝试看看VLN-CE能给我们提供什么东西
+def aim_distance_reward(completions, solution, **kwargs):
+    
+    pass
+
+
+# completions 是预测结果，类似于：[[{'role': 'assistant', 'content': 'stop'}]]
+# slution 是label，类似于：['turn right 45 degrees']
+# kwargs 是塞进去的乱七八糟的东西
+
+def test_rewards(completions, solution, **kwargs):
+    print(completions)
+    print(solution)
+    print("goal_position", kwargs["goal_position"])
+    print("distance_to_goal", kwargs["distance_to_goal"])
+    print("agent_position", kwargs["agent_position"])
+    print("agent_heading", kwargs["agent_heading"])
+    # exit()
+    return 1
+
 reward_funcs_registry = {
-    "accuracy": accuracy_reward,
-    "format": format_reward,
-    "length": cosine_rewards,
-    "repetition": repetition_rewards,
+    # "accuracy": accuracy_reward,
+    # "format": format_reward,
+    # "length": cosine_rewards,
+    # "repetition": repetition_rewards,
+    "test":test_rewards
 }
 
 @dataclass
@@ -924,20 +1048,27 @@ def get_vlm_module(model_name_or_path):
         return InvernVLModule
     else:
         raise ValueError(f"Unsupported model: {model_name_or_path}")
- 
+
 def main(script_args, training_args, model_args):
     # Load the VLM module
     vlm_module_cls = get_vlm_module(model_args.model_name_or_path)
     print("using vlm module:", vlm_module_cls.__name__)
-    # ! 得到问题模板，这里我们额外定义了VLN的模板
+    
+     # ! 得到问题模板，这里我们额外定义了VLN的模板
     question_prompt = vlm_module_cls.get_question_template(task_type=script_args.task_type)
 
-    # Get reward functions 
-    if script_args.is_reward_customized_from_vlm_module:
-        reward_funcs = [vlm_module_cls.select_reward_func(func, script_args.task_type) for func in script_args.reward_funcs]
-    else:
-        reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    print("reward_funcs:", reward_funcs)
+    # # Get reward functions 
+    # if script_args.is_reward_customized_from_vlm_module:
+    #     reward_funcs = [vlm_module_cls.select_reward_func(func, script_args.task_type) for func in script_args.reward_funcs]
+    # else:
+    #     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    # print("reward_funcs:", reward_funcs)
+    # exit()
+    
+    # reward_funcs = reward_funcs_registry
+    reward_funcs = [reward_funcs_registry[func] for func in reward_funcs_registry]
+    # print("reward_funcs:", reward_funcs)
+    # exit()
 
     # Load the JSONL datasets
     import json
@@ -975,8 +1106,9 @@ def main(script_args, training_args, model_args):
                         del item['image'] # remove the image column so that it can be loaded later
                     else:
                         raise ValueError(f"Unsupported image type: {type(item['image'])}")
-                # Remove immediate image loading
-                item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
+                # !Don't Remove immediate image loading
+                # item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
+                item['problem'] = item['conversations'][0]['value']
                 
                 # Handle solution that could be a float or string
                 solution_value = item['conversations'][1]['value']
@@ -988,46 +1120,53 @@ def main(script_args, training_args, model_args):
                 
                 del item['conversations']
                 item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
+                # item['position'] = 
+                # item['heading'] = 
+                # item[''] = 
                 all_data.append(item)
 
     dataset = Dataset.from_list(all_data)
     
-    # print(dataset[0])
-    # exit()
-
     def make_conversation_from_jsonl(example):
-        if 'image_path' in example and example['image_path'] is not None:
-            assert all(os.path.exists(p) for p in example['image_path']), f"Image paths do not exist: {example['image_path']}"
-            # Don't load image here, just store the path
-            return {
-                'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
-                'problem': example['problem'],
-                'solution': f"<answer> {example['solution']} </answer>",
-                'accu_reward_method': example['accu_reward_method'],
-                'prompt': [{
-                    'role': 'user',
-                    # 结构化输入方式，QwenVL的autoprocessor会自动进行处理，图像文本拼接后送入网络
-                    'content': [
-                        *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
-                        {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
-                    ]
-                }]
-            }
-        else:
-            return {
-                'problem': example['problem'],
-                'solution': f"<answer> {example['solution']} </answer>",
-                'accu_reward_method': example['accu_reward_method'],
-                'prompt': [{
-                    'role': 'user',
-                    'content': [
-                        {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
-                    ]
-                }]
-            }
+        image_paths = example.get("image_path", [])
+        num_images = len(image_paths)
+        assert all(os.path.exists(p) for p in image_paths), f"Image paths do not exist: {image_paths}"
 
-    # Map the conversations
+        # 将 prompt 按 <image> 分割为文本片段
+        prompt_template = example['problem']
+        text_parts = prompt_template.split("<image>")
+
+        # 构造 content：每个 text 后插一个 image（image 可能比 text 少一个）
+        content = []
+        for i, text in enumerate(text_parts):
+            if text.strip():
+                content.append({'type': 'text', 'text': text.strip()})  # 只含 text
+            if i < num_images:
+                content.append({'type': 'image', 'image': image_paths[i]})  # 只含 image
+
+        return {
+            'image_path': image_paths,
+            'problem': prompt_template,
+            # 'solution': f"<answer> {example['solution']} </answer>",
+            'solution': example['solution'],
+            # 'accu_reward_method': example['accu_reward_method'],
+            # 结构化输入方式，QwenVL的autoprocessor会自动进行处理，图像文本拼接后送入网络
+            'prompt': [{
+                'role': 'user',
+                'content': content
+            }],
+            'goal_position':example['goal_position'],
+            'distance_to_goal':example['distance_to_goal'],
+            'agent_heading':example['agent_heading'],
+        }
+        
+
+    # Map the conversations --> 这里会出问题，
+    # 因为dataset.map为了格式统一会给文本和图像分割添加 'image': None 与 ‘text': None
+    # 这将导致 trl.data_utils.maybe_apply_chat_template 处理的时候出问题
+    #! 修改了maybe_apply_chat_template时的代码，将去掉None字段的数据输入即可
     dataset = dataset.map(make_conversation_from_jsonl, num_proc=8)
+    
 
     # Split dataset for validation if requested
     splits = {'train': dataset}
@@ -1039,7 +1178,8 @@ def main(script_args, training_args, model_args):
         splits['validation'] = train_val_split['test']
 
     # Select trainer class based on vlm_trainer argument
-    trainer_cls = VLMGRPOTrainer
+    # trainer_cls = VLMGRPOTrainer
+    trainer_cls = VLMGRPOTrainer_VLN
     print("using trainer:", trainer_cls.__name__)
     
     #! 这里感觉好像没啥用呢--验证了确实没用
@@ -1077,6 +1217,7 @@ def main(script_args, training_args, model_args):
 if __name__ == "__main__":
     parser = TrlParser((GRPOScriptArguments, GRPOConfig, GRPOModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    
     training_args.bf16 = False
     training_args.fp16 = True
     
@@ -1087,7 +1228,7 @@ if __name__ == "__main__":
             print(f"⚠️ GPU compute capability {capability[0]}.{capability[1]} < 8.0")
             print("🔧 Forcing attn_implementation='sdpa'")
             model_args.attn_implementation = "sdpa"
-    
+            
     if training_args.deepspeed and "zero3" in training_args.deepspeed:
         print("zero3 is used, qwen2_5vl forward monkey patch is applied")
         monkey_patch_qwen2_5vl_forward()

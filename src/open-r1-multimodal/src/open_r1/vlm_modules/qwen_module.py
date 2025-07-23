@@ -3,6 +3,24 @@ from typing import Dict, Any, Union
 from trl.data_utils import maybe_apply_chat_template
 import torch
 
+
+def clean_prompt(example):
+    for message in example["prompt"]:
+        cleaned_content = []
+        for item in message["content"]:
+            if item["type"] == "text":
+                cleaned_content.append({
+                    "type": "text",
+                    "text": item["text"]
+                })
+            elif item["type"] == "image":
+                cleaned_content.append({
+                    "type": "image",
+                    "image": item["image"]
+                })
+        message["content"] = cleaned_content
+    return example
+
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
 
 class Qwen2VLModule(VLMBaseModule):
@@ -39,10 +57,12 @@ class Qwen2VLModule(VLMBaseModule):
     def get_custom_processing_keywords(self):
         return [('image_processor', 'max_pixels'), ('image_processor', 'min_pixels')]
     
+    # ! 这一步生成了 用于tokenrize的prompt
     def prepare_prompt(self, processing_class, inputs: dict[str, Union[torch.Tensor, Any]]):
-        prompts_text = [maybe_apply_chat_template(example, processing_class)["prompt"] for example in inputs]
+        prompts_text = [maybe_apply_chat_template(clean_prompt(example), processing_class)["prompt"] for example in inputs]
         return prompts_text
     
+    # ! 这一步调用 Autoprocessor 对输入进行了tokenrize
     def prepare_model_inputs(self, processing_class, prompts_text, images, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False):
         # FIXME
         # This could only process pure-multimodal or pure-text inputs
@@ -55,12 +75,22 @@ class Qwen2VLModule(VLMBaseModule):
                 padding_side=padding_side,
                 add_special_tokens=add_special_tokens)
         else:
+            
             prompt_inputs = processing_class(
                 text=prompts_text,
                 return_tensors=return_tensors,
                 padding=padding,
                 padding_side=padding_side,
                 add_special_tokens=add_special_tokens)
+        return prompt_inputs
+    
+    def parpare_moodel_inputs_struct(self, processing_class, prompts_text, images, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False):
+        prompt_inputs = processing_class(
+            text=prompts_text,
+            return_tensors=return_tensors,
+            padding=padding,
+            padding_side=padding_side,
+            add_special_tokens=add_special_tokens)
         return prompt_inputs
     
     @staticmethod
@@ -78,6 +108,8 @@ class Qwen2VLModule(VLMBaseModule):
                     "<think> reasoning process here </think><answer> answer here </answer>"
                 )
                 return SYSTEM_PROMPT + '\n' + "{Question}"
+            case "vln":
+                return "{Question}"
             case _:
                 return "{Question} First output the thinking process in <think> </think> tags and then output the final answer in <answer> </answer> tags."
             

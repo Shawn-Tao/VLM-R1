@@ -62,10 +62,12 @@ _deps = [
     "sentencepiece>=0.1.99",
     "torch>=2.5.1",
     "transformers==4.49.0",
-    "trl @ git+https://github.com/huggingface/trl.git@main",
+    # "trl @ git+https://github.com/huggingface/trl.git@main",
+    "trl==0.17.0",
     "vllm==0.6.6.post1",
     "wandb>=0.19.1",
     "pillow",
+    "json_repair",
 ]
 
 # this is a lookup table with items like:

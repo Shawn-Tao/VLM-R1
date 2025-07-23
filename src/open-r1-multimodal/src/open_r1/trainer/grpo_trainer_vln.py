@@ -60,6 +60,8 @@ if is_peft_available():
 
 if is_wandb_available():
     import wandb
+    # wandb.init(project="VLN-R1", name="run_xyz")
+    # wandb.init(project="VLN-R1")
 
 from open_r1.vlm_modules.vlm_module import VLMBaseModule
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
@@ -117,7 +119,7 @@ class RepeatRandomSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
-class VLMGRPOTrainer(Trainer):
+class VLMGRPOTrainer_VLN(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
@@ -200,7 +202,7 @@ class VLMGRPOTrainer(Trainer):
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
     """
-# class VLMGRPOTrainer(Trainer):
+
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -294,38 +296,30 @@ class VLMGRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        # Reference model
+        # !Reference model --- 修改了选项2和选项3的顺序，首先判断is_peft_model，在判断is_deepspeed_zero3_enabled
         self.beta = args.beta
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
+        elif is_peft_model(model):
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled to revert to the initial model.
+            print("******************** is_peft_model ********************")
+            self.ref_model = None
         elif is_deepspeed_zero3_enabled():
             self.ref_model = model_cls.from_pretrained(model_id, **model_init_kwargs)
-        elif is_peft_model(model):
-            # If PEFT is used, the reference model is not needed since the adapter can be disabled
-            # to revert to the initial model.
-            self.ref_model = None
         else:
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
 
         # Processing class
         if processing_class is None:
-            # ! 这里返回的是 transformer库中，QWEN2.5-VL的 AutoProcessor
             processing_cls = self.vlm_module.get_processing_class()
             processing_class = processing_cls.from_pretrained(model_id, trust_remote_code=model_init_kwargs.get("trust_remote_code", None))
-            
-            # 这里是为了获取图像的最大最小像素
-            ### def get_custom_processing_keywords(self):
-            ###     return [('image_processor', 'max_pixels'), ('image_processor', 'min_pixels')]
-            
             for component, processing_keyword in self.vlm_module.get_custom_processing_keywords():
                 if processing_keyword in kwargs:
                     # If we cannot find component in processing_class, return the processing_class itself
                     processing_component = getattr(processing_class, component, processing_class)
                     setattr(processing_component, processing_keyword, kwargs[processing_keyword])
-            
-            # 获取预训练模型的tokenizer中的特殊token ID,走的是 if里面的，
             if getattr(processing_class, "tokenizer",  None) is not None:
                 pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.pad_token_id = pad_token_id
@@ -334,19 +328,19 @@ class VLMGRPOTrainer(Trainer):
                 assert isinstance(processing_class, PreTrainedTokenizerBase), "processing_class must be an instance of PreTrainedTokenizerBase if it has no tokenizer attribute"
                 pad_token_id = processing_class.pad_token_id
 
-        # ! 这个函数里面是pass，很离谱
-        self.vlm_module.post_model_init(model, processing_class)
-        self.vlm_module.post_model_init(self.ref_model, processing_class)
+        # self.vlm_module.post_model_init(model, processing_class)
+        # self.vlm_module.post_model_init(self.ref_model, processing_class)
 
         # Reward functions
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
             if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                    reward_func, num_labels=1, **model_init_kwargs
-                )
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(reward_func, num_labels=1, **model_init_kwargs)
         self.reward_funcs = reward_funcs
+        
+        print(self.reward_funcs)
+        # exit()
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -502,9 +496,10 @@ class VLMGRPOTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
-    # ! 包含了模型推理的过程
+    #! 这是强化学习训练（如 PPO）中非常关键的一步，用于衡量当前策略（policy）生成某个 token 的置信度，便于后续计算 advantage、KL、reward 等指标。
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, **custom_multimodal_inputs):
+        # !输出为每个 token 的预测概率分布（vocab 上的 raw logits）
         logits = model(input_ids=input_ids, attention_mask=attention_mask, **custom_multimodal_inputs).logits  # (B, L, V)
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
         input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
@@ -531,20 +526,15 @@ class VLMGRPOTrainer(Trainer):
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
         
-        
-        print("input:***********************", inputs)
+        # print("*********************input:", inputs)
         # exit()
         
         device = self.accelerator.device
+        # Prompt + 图像预处理
         prompts = [x["prompt"] for x in inputs]
-        
-        # ! 这一步生成了 用于tokenrize的prompt --> 这里很有问题啊，把很多文本都包含在图片特殊字符之间了，需要重新实现一下，参考llama-factory来做吧
-        
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
         
-        print("prompts_text:***********************", prompts_text)
-        exit()
-        
+        # print("*********************prompts_text:",prompts_text)
         
         
         # Handle both pre-loaded images and image paths
@@ -573,8 +563,8 @@ class VLMGRPOTrainer(Trainer):
                 except:
                     pass
                 images.append(img)
-                
-        # ! 这一步调用 Autoprocessor 对输入进行了tokenrize
+       
+        #  Tokenization + 模型输入构建
         prompt_inputs = self.vlm_module.prepare_model_inputs(
             self.processing_class,
             prompts_text,
@@ -584,11 +574,10 @@ class VLMGRPOTrainer(Trainer):
             padding_side="left",
             add_special_tokens=False,
         )
-        # print("prompt_inputs:",prompt_inputs)
+
+        # print("prompt_inputs",prompt_inputs["input_ids"])
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        # print("prompt_inputs:",prompt_inputs)
-        # exit()
-        
+        # print("prompt_inputs_prepare",prompt_inputs["input_ids"])
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
 
@@ -599,7 +588,8 @@ class VLMGRPOTrainer(Trainer):
         #     prompt_mask = prompt_mask[:, -self.max_prompt_length :]
         #     prompt_inputs["attention_mask"] = prompt_mask
 
-        # Generate completions
+        # ! 这一步也是前向模型推理， 同时采样模型生成输入
+        # Generate completions--模型 generate:使用 generate 方法生成 completion_ids,根据 vlm_module.is_embeds_input() 判断是否拼接了 prompt 和 completion（常见于 Qwen、MiniGPT）。prompt_length：用于分离 prompt / completion
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             generate_returned_result = unwrapped_model.generate(
                 **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
@@ -616,7 +606,7 @@ class VLMGRPOTrainer(Trainer):
                 completion_ids = generate_returned_result
                 prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
-        # Mask everything after the first EOS token
+        # Mask everything after the first EOS token--截断 EOS 后 completion token：,生成的 completion 可能较长，mask 掉 EOS 之后的部分。
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
@@ -626,11 +616,11 @@ class VLMGRPOTrainer(Trainer):
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
-        # Get the multimodal inputs
+        # Get the multimodal inputs -- >只获取['pixel_values', 'image_grid_thw']两个字段
         multimodal_keywords = self.vlm_module.get_custom_multimodal_keywords()
         multimodal_inputs = {k: prompt_inputs[k] if k in prompt_inputs else None for k in multimodal_keywords}
         
-        #! 这里利用模型计算了每个token的log概率
+        #! 这里利用模型计算了每个token的log概率，进行了两次前向推理，分别是当前模型和ref模型的前向推理
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
             # computation here, and use per_token_logps.detach() instead.
@@ -665,22 +655,25 @@ class VLMGRPOTrainer(Trainer):
         # No need to duplicate prompts as we're not generating multiple completions per prompt
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
+        for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+            # ! 情况1，如果 reward_func 是一个 PreTrainedModel--这个 reward_func 是一个 huggingface 模型，比如：一个分类模型、RLHF reward model，用于打分。
             if isinstance(reward_func, PreTrainedModel):
+                # ! 拼接 prompt 和 completion 为输入（文本形式）：
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
                     texts = [p + c for p, c in zip(prompts, completions)]
-                reward_inputs = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
+                # ! 调用 reward_processing_class 进行分词/tokenization --> 用于将字符串输入转为 transformer 输入（input_ids、attention_mask）
+                reward_inputs = reward_processing_class(texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False)
                 reward_inputs = super()._prepare_inputs(reward_inputs)
+                
+                # ! 执行推理并提取 reward 分数（logits[:, 0]）-- > 通常 reward 模型是一个 regression 输出，所以 logits[:, 0] 是 scalar 分数。
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            # ! 情况2，reward_func 是一个 自定义 Python 函数
             else:
+                #! 整理除 prompt、completion 外的额外字段
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                 for key in reward_kwargs:
@@ -688,21 +681,24 @@ class VLMGRPOTrainer(Trainer):
                         # No need to duplicate prompts as we're not generating multiple completions per prompt
                         # reward_kwargs[key].extend([example[key]] * self.num_generations)
                         reward_kwargs[key].extend([example[key]])
+                #! 调用 reward_func 并将输出装入 tensor
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        #! 多 GPU 并行训练场景下的聚合操作：使用 accelerator 收集不同 GPU 上的 reward 结果，保持同步。
         # Gather rewards across processes
         rewards_per_func = self.accelerator.gather(rewards_per_func)
         
+        #! 最终 reward 聚合：将每个 prompt-completion 的多个 reward 相加，作为最终用于计算 advantage 的 reward。
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
         
-        # Compute grouped-wise rewards
+        # Compute grouped-wise rewards 
         # Each group consists of num_generations completions for the same prompt
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
         
-        # Normalize the rewards to compute the advantages
+        # Normalize the rewards to compute the advantages --优势计算 (Advantage = 归一化的 reward)
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
@@ -748,7 +744,6 @@ class VLMGRPOTrainer(Trainer):
         # Check if we need to generate new completions or use buffered ones 
         # ! 优势函数也是这里计算的
         if self.state.global_step % self.num_iterations == 0:
-            # !_generate_and_score_completions 中包含了对input prompt的 tokenrize，这里之后出来的就是tokenrize之后的 文字和图像 对应token
             inputs = self._generate_and_score_completions(inputs, model)
             self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
         else:
@@ -764,6 +759,7 @@ class VLMGRPOTrainer(Trainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
+        #! 可能是第四次前向推理，如果本轮进行了 _generate_and_score_completions 函数处理
         # Get the current policy's log probabilities
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, **multimodal_inputs)
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
